@@ -22,6 +22,8 @@ namespace NomisKitchen.Reports
         const int MaxPending = 5;
         const int UploadTimeoutMs = 120_000;
         static readonly TimeSpan SettleDelay = TimeSpan.FromSeconds(5);
+        static readonly TimeSpan BuildLimit = TimeSpan.FromMinutes(5);
+        const int UploadGraceMs = 30_000;
 
         readonly ReporterConfig _config;
         static string _userAgent = "NomisKitchenHDT";
@@ -117,12 +119,14 @@ namespace NomisKitchen.Reports
         async Task<Result> CollectAndUploadAsync(string reason, string note, GameInfo game, string reporterTag)
         {
             byte[] zip;
+            var watch = System.Diagnostics.Stopwatch.StartNew();
             try { zip = await Task.Run(() => Build(reason, note, game, reporterTag)).ConfigureAwait(false); }
             catch (Exception ex)
             {
                 Log.Error("Log report: could not collect the logs", ex);
                 return Result.Failed("Could not collect the logs: " + ex.Message);
             }
+            Log.Info("Log report built (" + reason + "): " + zip.Length / 1024 + " KB in " + watch.Elapsed.TotalSeconds.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) + " s");
             var result = await UploadAsync(zip).ConfigureAwait(false);
             if (result.Ok)
             {
@@ -138,6 +142,7 @@ namespace NomisKitchen.Reports
 
         byte[] Build(string reason, string note, GameInfo game, string reporterTag)
         {
+            var deadline = new BuildDeadline(BuildLimit);
             var priority = BackgroundMode.Enter();
             try
             {
@@ -158,11 +163,11 @@ namespace NomisKitchen.Reports
                 var battleTag = FindBattleTag(power, reporterTag);
                 redactor.Keep(battleTag);
                 int? build = game?.HsBuild;
-                power?.ForEachLine(line =>
+                power?.ForEachLine((line, length) =>
                 {
-                    redactor.Learn(line);
-                    if (build == null) build = BuildNumber(line);
-                });
+                    if (Redactor.MayLearn(line, length)) redactor.Learn(Encoding.UTF8.GetString(line, 0, length));
+                    if (build == null) build = BuildNumber(line, length);
+                }, deadline.Check);
                 foreach (var text in new[] { bepinex?.Text, plugin?.Text })
                     ForEachLine(text, redactor.Learn);
 
@@ -202,7 +207,7 @@ namespace NomisKitchen.Reports
                     {
                         var present = manifest.Where(kv => kv.Value != null).ToDictionary(kv => kv.Key, kv => kv.Value);
                         WriteEntry(zip, "manifest.json", MiniJson.Write(present), null);
-                        if (power != null) PowerLogEncoder.Write(zip, power.ForEachLine, redactor.CleanGameLine);
+                        if (power != null) PowerLogEncoder.Write(zip, action => power.ForEachLine(action, deadline.Check), redactor, deadline);
                         if (bepinex != null) WriteEntry(zip, "bepinex.log", bepinex.Text, redactor);
                         if (plugin != null) WriteEntry(zip, "plugin.log", plugin.Text, redactor);
                     }
@@ -218,12 +223,15 @@ namespace NomisKitchen.Reports
 
         static readonly Regex PlayerNameField = new Regex(@"PlayerName=(?<name>[^\r\n]+)", RegexOptions.CultureInvariant);
 
-        static int? BuildNumber(string line)
+        static readonly byte[] BuildNumberBytes = ByteText.Ascii("BuildNumber=");
+        static readonly byte[] PlayerNameBytes = ByteText.Ascii("PlayerName=");
+
+        static int? BuildNumber(byte[] line, int length)
         {
-            int at = line.IndexOf("BuildNumber=", StringComparison.Ordinal);
+            int at = ByteText.IndexOf(line, length, BuildNumberBytes);
             if (at < 0) return null;
             int value = 0, digits = 0;
-            for (int i = at + 12; i < line.Length && digits < 9 && line[i] >= '0' && line[i] <= '9'; i++, digits++)
+            for (int i = at + BuildNumberBytes.Length; i < length && digits < 9 && line[i] >= '0' && line[i] <= '9'; i++, digits++)
                 value = value * 10 + (line[i] - '0');
             return digits > 0 ? value : (int?)null;
         }
@@ -233,10 +241,10 @@ namespace NomisKitchen.Reports
             if (string.IsNullOrWhiteSpace(reporter)) return null;
             if (reporter.IndexOf('#') > 0 || powerLog == null) return reporter;
             string match = null;
-            powerLog.ForEachLine(line =>
+            powerLog.ForEachLine((line, length) =>
             {
-                if (match != null || line.IndexOf("PlayerName=", StringComparison.Ordinal) < 0) return;
-                var name = PlayerNameField.Match(line).Groups["name"].Value.Trim();
+                if (match != null || ByteText.IndexOf(line, length, PlayerNameBytes) < 0) return;
+                var name = PlayerNameField.Match(Encoding.UTF8.GetString(line, 0, length)).Groups["name"].Value.Trim();
                 if (name.StartsWith(reporter + "#", StringComparison.Ordinal)) match = name;
             });
             return match ?? reporter;
@@ -245,8 +253,20 @@ namespace NomisKitchen.Reports
         static readonly Regex BepInExHeader = new Regex(@"^\[(?<level>[A-Za-z]+)\s*:\s*(?<source>[^\]]+)\]", RegexOptions.CultureInvariant);
         static readonly HashSet<string> OwnSources = new HashSet<string>(StringComparer.Ordinal)
         {
-            "BepInEx", "Nomi Can't Dance", "Nomi's Kitchen APM Provider", "Nomi Hates Abbreviation", "Nomi's Kitchen",
+            "Nomi Can't Dance", "Nomi's Kitchen APM Provider", "Nomi Hates Abbreviation", "Nomi's Kitchen",
         };
+        static readonly string[] BepInExLinesKept =
+        {
+            "BepInEx 5", "Running under Unity", "CLR runtime version", "System platform", "Chainloader startup complete",
+        };
+        // Shared with HDT reporting: HDT installs NomiCantDance, NomiHatesAbbreviation and NomisKitchenApm as separate DLLs.
+        static readonly HashSet<string> OwnPluginFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "com.community.hs.NomisKitchen.dll", "com.community.hs.NomiCantDance.dll",
+            "com.community.hs.NomiHatesAbbreviation.dll", "com.community.hs.NomisKitchenApm.dll",
+        };
+
+        static bool MentionsNomi(string line) => line.IndexOf("Nomi", StringComparison.OrdinalIgnoreCase) >= 0;
 
         static Captured OwnLines(Captured log)
         {
@@ -259,7 +279,10 @@ namespace NomisKitchen.Reports
                 if (header.Success)
                 {
                     var level = header.Groups["level"].Value;
-                    keep = OwnSources.Contains(header.Groups["source"].Value.Trim()) || level == "Error" || level == "Fatal";
+                    var source = header.Groups["source"].Value.Trim();
+                    if (OwnSources.Contains(source)) keep = true;
+                    else if (source == "BepInEx") keep = MentionsNomi(line) || BepInExLinesKept.Any(k => line.IndexOf(k, StringComparison.Ordinal) >= 0);
+                    else keep = (level == "Error" || level == "Fatal") && MentionsNomi(line);
                 }
                 if (keep) kept.Append(line.Replace(" This mod modifies the Hearthstone client; Blizzard's terms do not allow client modification.", "")).Append('\n');
                 else dropped++;
@@ -333,6 +356,7 @@ namespace NomisKitchen.Reports
                 var dir = HearthstonePaths.BepInExPlugins(install);
                 if (dir == null || !Directory.Exists(dir)) return null;
                 return Directory.GetFiles(dir, "*.dll", SearchOption.AllDirectories)
+                    .Where(f => OwnPluginFiles.Contains(Path.GetFileName(f)))
                     .Select(f => f.Substring(dir.Length).TrimStart('\\', '/'))
                     .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
                     .ToList();
@@ -411,14 +435,17 @@ namespace NomisKitchen.Reports
             ReportAnswer answer;
             try
             {
-                answer = await transport(new ReportUpload
+                var sending = transport(new ReportUpload
                 {
                     Url = Endpoint,
                     Body = zip,
                     ContentType = "application/zip",
                     UserAgent = _userAgent,
                     TimeoutSeconds = UploadTimeoutMs / 1000,
-                }).ConfigureAwait(false);
+                });
+                if (await Task.WhenAny(sending, Task.Delay(UploadTimeoutMs + UploadGraceMs)).ConfigureAwait(false) != sending)
+                    return Result.Failed("nomi.gg did not answer in time", true);
+                answer = await sending.ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -559,20 +586,45 @@ namespace NomisKitchen.Reports
 
             public bool Truncated => _ranges.Length > 1;
 
-            public void ForEachLine(Action<string> action)
+            public void ForEachLine(ByteLine action, Action check = null)
             {
+                var chunk = new byte[1 << 16];
+                var line = new byte[1 << 12];
                 using (var stream = OpenShared(_path))
                 {
                     foreach (var range in _ranges)
                     {
-                        if (range.Before != null) action(range.Before);
-                        stream.Position = range.Start;
-                        using (var reader = new StreamReader(new Bounded(stream, range.Length), Encoding.UTF8, false, 1 << 16, true))
+                        if (range.Before != null)
                         {
-                            if (range.SkipFirstLine) reader.ReadLine();
-                            string line;
-                            while ((line = reader.ReadLine()) != null) action(line);
+                            var before = Encoding.UTF8.GetBytes(range.Before);
+                            action(before, before.Length);
                         }
+                        stream.Position = range.Start;
+                        long left = range.Length;
+                        int used = 0;
+                        bool skipping = range.SkipFirstLine;
+                        while (left > 0)
+                        {
+                            check?.Invoke();
+                            int read = stream.Read(chunk, 0, (int)Math.Min(chunk.Length, left));
+                            if (read <= 0) break;
+                            left -= read;
+                            for (int i = 0; i < read; i++)
+                            {
+                                byte c = chunk[i];
+                                if (c == (byte)'\n')
+                                {
+                                    if (skipping) skipping = false;
+                                    else action(line, used > 0 && line[used - 1] == (byte)'\r' ? used - 1 : used);
+                                    used = 0;
+                                    continue;
+                                }
+                                if (skipping) continue;
+                                if (used == line.Length) Array.Resize(ref line, line.Length * 2);
+                                line[used++] = c;
+                            }
+                        }
+                        if (used > 0 && !skipping) action(line, line[used - 1] == (byte)'\r' ? used - 1 : used);
                     }
                 }
             }
@@ -585,34 +637,24 @@ namespace NomisKitchen.Reports
             }
         }
 
-        sealed class Bounded : Stream
+        sealed class BuildDeadline : SevenZip.ICodeProgress
         {
-            readonly Stream _inner;
-            long _remaining;
+            readonly DateTime _limit;
+            readonly TimeSpan _span;
 
-            public Bounded(Stream inner, long length)
+            public BuildDeadline(TimeSpan span)
             {
-                _inner = inner;
-                _remaining = length;
+                _span = span;
+                _limit = DateTime.UtcNow + span;
             }
 
-            public override int Read(byte[] buffer, int offset, int count)
+            public void Check()
             {
-                if (_remaining <= 0) return 0;
-                int read = _inner.Read(buffer, offset, (int)Math.Min(count, _remaining));
-                _remaining -= read;
-                return read;
+                if (DateTime.UtcNow > _limit)
+                    throw new TimeoutException("building the report took longer than " + (int)_span.TotalMinutes + " minutes");
             }
 
-            public override bool CanRead => true;
-            public override bool CanSeek => false;
-            public override bool CanWrite => false;
-            public override long Length => throw new NotSupportedException();
-            public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
-            public override void Flush() { }
-            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-            public override void SetLength(long value) => throw new NotSupportedException();
-            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+            public void SetProgress(long inSize, long outSize) => Check();
         }
 
         sealed class Captured
