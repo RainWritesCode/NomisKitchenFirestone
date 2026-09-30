@@ -22,12 +22,17 @@ namespace NomisKitchen.Reports
         static readonly Regex Secret = new Regex(@"(?i)\b(access_token|refresh_token|id_token|api[_-]?key|apikey|client_secret|secret|password|passwd|token|session_?id|sessionkey|auth(?:orization)?)(""?\s*[:=]\s*""?)[^\s""',;&]{6,}", Options);
         static readonly Regex Bearer = new Regex(@"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}", Options);
         static readonly HashSet<string> NotNames = new HashSet<string>(StringComparer.Ordinal) { "GameEntity", "UNKNOWN", "0" };
+        static readonly byte[] PlayerNameBytes = ByteText.Ascii("PlayerName=");
+        static readonly byte[] EntityBytes = ByteText.Ascii("Entity=");
+        static readonly byte[] AccountBytes = ByteText.Ascii("hi=");
 
         readonly Dictionary<string, string> _aliases = new Dictionary<string, string>(StringComparer.Ordinal);
         readonly HashSet<string> _kept = new HashSet<string>(StringComparer.Ordinal);
         readonly Regex _profiles;
         readonly Regex _userSegment;
         Regex _names;
+        byte[][][] _namesByFirstByte;
+        int _namePatternCount = -1;
 
         public Redactor()
         {
@@ -71,6 +76,47 @@ namespace NomisKitchen.Reports
             if (string.IsNullOrEmpty(name)) return;
             _kept.Add(name);
             if (_aliases.Remove(name)) _names = null;
+        }
+
+        internal static bool MayLearn(byte[] line, int length)
+        {
+            if (ByteText.IndexOf(line, length, (byte)'#') >= 0 || ByteText.IndexOf(line, length, PlayerNameBytes) >= 0) return true;
+            for (int at = ByteText.IndexOf(line, length, EntityBytes); at >= 0; at = ByteText.IndexOf(line, length, EntityBytes, at + 1))
+            {
+                int next = at + EntityBytes.Length;
+                if (next < length && line[next] != (byte)'[') return true;
+            }
+            return false;
+        }
+
+        internal bool MayChange(byte[] line, int length)
+        {
+            if (ByteText.IndexOf(line, length, (byte)'#') >= 0 || ByteText.IndexOf(line, length, AccountBytes) >= 0) return true;
+            if (_aliases.Count == 0) return false;
+            if (_namePatternCount != _aliases.Count) BuildNamePatterns();
+            for (int i = 0; i < length; i++)
+            {
+                var candidates = _namesByFirstByte[line[i]];
+                if (candidates == null) continue;
+                foreach (var pattern in candidates)
+                    if (ByteText.StartsAt(line, length, i, pattern)) return true;
+            }
+            return false;
+        }
+
+        void BuildNamePatterns()
+        {
+            var byFirst = new List<byte[]>[256];
+            foreach (var name in _aliases.Keys)
+            {
+                var bytes = System.Text.Encoding.UTF8.GetBytes(name);
+                if (bytes.Length == 0) continue;
+                (byFirst[bytes[0]] ?? (byFirst[bytes[0]] = new List<byte[]>())).Add(bytes);
+            }
+            _namesByFirstByte = new byte[256][][];
+            for (int i = 0; i < 256; i++)
+                if (byFirst[i] != null) _namesByFirstByte[i] = byFirst[i].ToArray();
+            _namePatternCount = _aliases.Count;
         }
 
         public void Learn(string line)

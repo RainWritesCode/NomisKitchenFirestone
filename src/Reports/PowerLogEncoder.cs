@@ -1,54 +1,93 @@
 using System;
 using System.IO;
-using System.Text;
 using SevenZip;
 
 namespace NomisKitchen.Reports
 {
+    internal delegate void ByteLine(byte[] line, int length);
+
+    internal static class ByteText
+    {
+        internal static byte[] Ascii(string text) => System.Text.Encoding.ASCII.GetBytes(text);
+
+        internal static int IndexOf(byte[] line, int length, byte value, int from = 0)
+        {
+            for (int i = from; i < length; i++)
+                if (line[i] == value) return i;
+            return -1;
+        }
+
+        internal static int IndexOf(byte[] line, int length, byte[] pattern, int from = 0)
+        {
+            int last = length - pattern.Length;
+            byte first = pattern[0];
+            for (int i = from; i <= last; i++)
+            {
+                if (line[i] != first) continue;
+                if (StartsAt(line, length, i, pattern)) return i;
+            }
+            return -1;
+        }
+
+        internal static bool StartsAt(byte[] line, int length, int at, byte[] pattern)
+        {
+            if (at + pattern.Length > length) return false;
+            for (int j = 0; j < pattern.Length; j++)
+                if (line[at + j] != pattern[j]) return false;
+            return true;
+        }
+    }
+
     internal static class PowerLogEncoder
     {
         internal const string TextEntry = "power.text.lzma";
         internal const string TimesEntry = "power.time.lzma";
         internal const string Encoding = "lzma-split-v1";
-        const int DictionarySize = 1 << 23;
+        static readonly int DictionarySize = Type.GetType("Mono.Runtime") != null ? 1 << 21 : 1 << 23;
         const int FastBytes = 32;
         const int PrefixLength = 19;
 
-        internal static void Write(ReportZip zip, Action<Action<string>> forEachLine, Func<string, string> clean)
+        internal static void Write(ReportZip zip, Action<ByteLine> forEachLine, Redactor redactor, ICodeProgress progress)
         {
             var textPath = Path.Combine(Path.GetTempPath(), "nomi-power-" + Guid.NewGuid().ToString("N") + ".txt");
             try
             {
                 var times = new MemoryStream();
                 long previous = 0;
-                using (var text = new StreamWriter(new FileStream(textPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16), new UTF8Encoding(false)))
+                using (var text = new FileStream(textPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16))
                 {
-                    forEachLine(raw =>
+                    forEachLine((raw, rawLength) =>
                     {
-                        var line = clean(raw);
-                        if (TryTicks(line, out long ticks))
+                        byte[] line = raw;
+                        int length = rawLength;
+                        if (redactor.MayChange(raw, rawLength))
+                        {
+                            line = System.Text.Encoding.UTF8.GetBytes(redactor.CleanGameLine(System.Text.Encoding.UTF8.GetString(raw, 0, rawLength)));
+                            length = line.Length;
+                        }
+                        if (TryTicks(line, length, out long ticks))
                         {
                             WriteVarint(times, ticks - previous);
                             previous = ticks;
-                            text.Write('\u0001');
-                            text.Write(line.Substring(PrefixLength));
+                            text.WriteByte(1);
+                            text.Write(line, PrefixLength, length - PrefixLength);
                         }
-                        else if (line.Length > 0 && (line[0] == '\u0001' || line[0] == '\u0002'))
+                        else if (length > 0 && (line[0] == 1 || line[0] == 2))
                         {
-                            text.Write('\u0002');
-                            text.Write(line);
+                            text.WriteByte(2);
+                            text.Write(line, 0, length);
                         }
                         else
                         {
-                            text.Write(line);
+                            text.Write(line, 0, length);
                         }
-                        text.Write('\n');
+                        text.WriteByte((byte)'\n');
                     });
                 }
                 using (var input = new FileStream(textPath, FileMode.Open, FileAccess.Read, FileShare.None, 1 << 16))
-                    WriteLzma(zip, TextEntry, input);
+                    WriteLzma(zip, TextEntry, input, progress);
                 times.Position = 0;
-                WriteLzma(zip, TimesEntry, times);
+                WriteLzma(zip, TimesEntry, times, progress);
             }
             finally
             {
@@ -56,10 +95,10 @@ namespace NomisKitchen.Reports
             }
         }
 
-        static bool TryTicks(string line, out long ticks)
+        static bool TryTicks(byte[] line, int length, out long ticks)
         {
             ticks = 0;
-            if (line.Length < PrefixLength || line[0] != 'D' || line[1] != ' ' || line[4] != ':' || line[7] != ':' || line[10] != '.' || line[18] != ' ')
+            if (length < PrefixLength || line[0] != 'D' || line[1] != ' ' || line[4] != ':' || line[7] != ':' || line[10] != '.' || line[18] != ' ')
                 return false;
             if (!Digits(line, 2, 2, out long hours) || !Digits(line, 5, 2, out long minutes) || !Digits(line, 8, 2, out long seconds)
                 || !Digits(line, 11, 7, out long fraction) || hours > 23 || minutes > 59 || seconds > 59)
@@ -68,12 +107,12 @@ namespace NomisKitchen.Reports
             return true;
         }
 
-        static bool Digits(string line, int start, int count, out long value)
+        static bool Digits(byte[] line, int start, int count, out long value)
         {
             value = 0;
             for (int i = start; i < start + count; i++)
             {
-                char c = line[i];
+                byte c = line[i];
                 if (c < '0' || c > '9') return false;
                 value = value * 10 + (c - '0');
             }
@@ -91,7 +130,7 @@ namespace NomisKitchen.Reports
             } while (zigzag != 0);
         }
 
-        static void WriteLzma(ReportZip zip, string name, Stream input)
+        static void WriteLzma(ReportZip zip, string name, Stream input, ICodeProgress progress)
         {
             using (var output = zip.Create(name))
             {
@@ -102,7 +141,7 @@ namespace NomisKitchen.Reports
                 encoder.WriteCoderProperties(output);
                 long size = input.Length;
                 for (int i = 0; i < 8; i++) output.WriteByte((byte)(size >> (8 * i)));
-                encoder.Code(input, output, size, -1, null);
+                encoder.Code(input, output, size, -1, progress);
             }
         }
     }

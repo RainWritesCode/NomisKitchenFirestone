@@ -17,7 +17,7 @@ namespace NomisKitchen
     {
         public const string Guid = "com.community.hs.NomisKitchen";
         public const string DisplayName = "Nomi's Kitchen";
-        public const string Version = "1.1.0";
+        public const string Version = "1.1.1";
         const string ListedName = "Nomi’s Kitchen";
         const string StandaloneDanceFix = "com.community.hs.NomiCantDance";
         const string StandaloneFullNumbers = "com.community.hs.NomiHatesAbbreviation";
